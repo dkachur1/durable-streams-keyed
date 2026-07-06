@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Verifies the REAL @durable-streams/client + @durable-streams/state JS clients
-// against the patched ds-indexed-rust server's keyed reads (?key=<key>).
+// against the patched durable-streams-keyed server's keyed reads (?key=<key>).
 //
 // Two things under test, in priority order (see ../README.md at repo root and
 // this dir's README.md for the full writeup):

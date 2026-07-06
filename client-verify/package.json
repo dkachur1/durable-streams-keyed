@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "version": "0.0.0",
-  "description": "Verifies the real @durable-streams/client + @durable-streams/state JS clients against the patched ds-indexed-rust server's keyed reads (?key=).",
+  "description": "Verifies the real @durable-streams/client + @durable-streams/state JS clients against the patched durable-streams-keyed server's keyed reads (?key=).",
   "scripts": {
     "test": "node run.mjs"
   },

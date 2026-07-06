@@ -1,4 +1,4 @@
-ds-indexed-rust
+durable-streams-keyed
 Copyright 2026 Danylo Kachur
 
 This project vendors and patches source from `durable-streams` 0.1.2

@@ -1,7 +1,7 @@
 # client-verify
 
 Verifies the **real** Durable Streams JS client packages against
-`ds-indexed-rust`'s patched keyed-read support (`?key=<key>`), which had only
+`durable-streams-keyed`'s patched keyed-read support (`?key=<key>`), which had only
 been exercised via curl/oha (`../bench/bench-keyed.sh`) until now. No Rust
 source is touched here — this only runs the prebuilt server binary and drives
 it with the actual npm clients.
