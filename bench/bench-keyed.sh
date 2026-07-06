@@ -170,7 +170,7 @@ BODYSIZES=$(jq -n --argjson keyed "$KEYED_BYTES" --argjson full "$FULL_BYTES" \
 # assemble results file
 printf '%s\n' "${RESULTS[@]}" | jq -s --arg label "$LABEL" --argjson n "$N" --argjson k "$K" \
   --argjson appendsize "$APPENDSIZE" --argjson body "$BODYSIZES" \
-  '{label:$label, n:$n, k:$k, appendsize:$appendsize, body_sizes:$body, scenarios:.}' > "$OUT"
+  '{"label":$label, n:$n, k:$k, appendsize:$appendsize, body_sizes:$body, scenarios:.}' > "$OUT"
 echo "### wrote $OUT" >&2
 jq . "$OUT"
 

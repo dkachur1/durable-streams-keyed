@@ -35,28 +35,28 @@ depend on — see `docs/integration-points.md`).
 > methodology, for baseline-vs-change on one box. Reproduce: `bench/bench-keyed.sh`.
 
 **Keyed read isolates one conversation** — one stream, 2000 appends round-robin
-across K=50 keys, ~200 B each; medians of 3×5 s:
+across K=50 keys, ~200 B each; medians of 3×6 s, Linux container:
 
 | scenario | rps | p50 | p99 | data returned |
 |---|--:|--:|--:|--:|
-| `?key=conv-7` (one conversation) | 16,237 | 3.2 ms | 14.6 ms | **8 KB** |
-| full stream (client-side filter) | 24,356 | 2.6 ms | 3.4 ms | 400 KB |
+| `?key=conv-7` (one conversation) | **41,113** | 1.3 ms | 5.0 ms | **8 KB** |
+| full stream (client-side filter) | 18,000 | 3.4 ms | 8.4 ms | 400 KB |
 
-Returns **50× less data** (8 KB vs 400 KB — exactly 1/K, proving correct
-server-side filtering) at ~⅔ the throughput of reading everything. Filtering a
-byte-log costs more CPU (it reads the coalesced superset and copies out the
-wanted spans) — the win is wire-data reduction, decisive when the network, not
-the CPU, is the bottleneck.
+Keyed reads return **50× less data** (8 KB vs 400 KB — exactly 1/K, proving
+correct server-side filtering) *and* run faster than reading the whole stream
+(the full read is loopback-bandwidth-bound at 400 KB/response; the keyed read
+moves 8 KB). vs Bun on the same kernel, this keyed read is ~7× faster — see
+below.
 
 <details>
 <summary><b>Why it got 10× faster, and base-server numbers</b></summary>
 
 <br>
 
-The keyed read went **1,644 → 16,237 rps** once it (a) read resident-cache-first
-instead of per-span file reads and (b) coalesced a key's scattered spans into few
-contiguous reads — porting Prisma's *serving pattern* ("one contiguous read,
-filter in RAM"), **not** its probabilistic index.
+The keyed read went **1,644 → 16,237 rps on macOS** (41,113 on Linux) once it (a)
+read resident-cache-first instead of per-span file reads and (b) coalesced a
+key's scattered spans into few contiguous reads — porting Prisma's *serving
+pattern* ("one contiguous read, filter in RAM"), **not** its probabilistic index.
 
 Base server (unpatched, hot stream, `.bench-local.sh`): read1k 161,768 rps
 (p50 0.39 ms), read1m 10,715 rps (p50 2.95 ms, `sendfile`), append 7,808 rps
@@ -67,48 +67,47 @@ Base server (unpatched, hot stream, `.bench-local.sh`): read1k 161,768 rps
 
 ### vs Bun, on the same machine
 
-Prisma's Bun server (`prisma/streams` @ `b891877`, v0.1.11; Bun 1.3.9) run on
-**this box with the same harness** (N=2000, K=50, ~200 B, c=64, 6 s × 3). Both do
-keyed reads with **zero schema setup** (default profile) — no config divergence.
+Prisma's Bun server (`prisma/streams` @ `b891877`, v0.1.11) benchmarked with the
+same `oha` harness (N=2000, K=50, ~200 B, c=64, 6 s × 3). Both keyed reads are
+**zero-config** (default profile) — no divergence.
 
-| scenario | This (Rust) | Bun | 
-|---|--:|--:|
-| **keyed read** `?key=` | **16,237 rps** · 3.2 ms p50 | 6,485 rps · 9.5 ms p50 |
-| &nbsp;&nbsp;↳ CPU per request | ~1,180% total | **~100% total** |
-| **full read** (uncapped) | **24,356 rps** · 2.6 ms | 1,135 rps · 54.5 ms |
-| append (unkeyed) | ~7,808 rps | ~203 rps* |
+**Both servers in one Linux container, same kernel** — the definitive run, with
+Rust's `#[cfg(target_os = "linux")]` zero-copy paths compiled in:
 
-> [!IMPORTANT]
-> **Measured on macOS, where Rust's zero-copy read path is disabled.** The
-> `sendfile` read path is `#[cfg(target_os = "linux")]`, so on this Mac the Rust
-> server served *unkeyed* reads via a buffered fallback — meaning the **full-read
-> and append numbers understate Rust** (on Linux it would use `sendfile`). Keyed
-> reads serve a materialized `Body::Full` on both platforms, so that number is
-> representative. The definitive comparison is **both servers on the same Linux
-> host** — an outstanding TODO, not yet run.
+| scenario | This (Rust) | Bun (uncapped) | Rust |
+|---|--:|--:|--:|
+| **keyed read** `?key=` | **41,113 rps** · 1.3 ms | 5,787 rps · 9.9 ms | **~7.1×** |
+| **full read** | **18,000 rps** · 3.4 ms | 803 rps · 77 ms | **~22×** |
+| keyed CPU per req | 300%/41k = **0.007** | 100%/5.8k = 0.017 | ~2.4× leaner |
 
-**The honest read:**
-- **Keyed read** — Rust is ~2.5× the throughput and ~3× lower latency, **but at
-  ~4.5× the CPU per request.** Our speed comes from reading the coalesced
-  *superset* across many cores; Bun's fingerprint index touches only the
-  relevant blocks (~1 core). So *per core*, Bun's keyed read is leaner — the
-  concrete case for wiring `crates/ds-index` when CPU-bound or at cold-segment
-  scale. Rust wins wall-clock here; Bun wins CPU-efficiency.
-- **Full read** — Rust ~21× (native zero-copy `sendfile` vs interpreted copy).
-  This is the base-path gap, and it's large.
-- **Append*** — Bun measured ~203 rps / ~330 ms p50, low enough that it looks
-  like queueing under c=64 / local-mode ingest tuning rather than a clean
-  throughput number; flagged, **not** root-caused — don't read it as a
-  definitive multiple.
-- Bun defaults to a 1000-record read cap (a stock `GET` returned half the
-  stream); the full-read number above is with that cap raised, for parity.
+On the same kernel Rust wins keyed reads **~7× on throughput and ~2.4× on
+CPU-per-request**, and full reads ~22×. Full breakdown + toolchain:
+`bench/bun/linux/RESULTS.md`.
 
-Raw numbers + scripts in `bench/bun/`.
+> [!NOTE]
+> **This supersedes the earlier macOS numbers.** On macOS the zero-copy read
+> path (`#[cfg(target_os = "linux")]`) is off, so Rust ran a buffered fallback —
+> which both slowed its reads *and* made keyed reads look CPU-hungry (~1,180%).
+> The Linux run shows that CPU cost was a **macOS artifact**: on Linux Rust keyed
+> reads are actually *leaner* per request than Bun. The earlier "Bun wins
+> CPU-efficiency" read does not hold on the real target platform.
+
+<details>
+<summary>macOS numbers (superseded — zero-copy read path disabled)</summary>
+
+<br>
+
+Same harness on macOS (`oha` 1.14.0): Rust keyed 16,237 rps · 3.2 ms (but
+~1,180% cpu, the fallback artifact) vs Bun 6,485 · 9.5 ms; Rust full 24,356 vs
+Bun 1,135. Bun's stock 1000-record cap returns half the stream, so uncapped is
+used for full-read parity. Raw numbers in `bench/bun/`.
+
+</details>
 
 ## What works
 
 - **`Stream-Key` on append + `?key=` filtered reads** — isolate one conversation; composes with `?offset=`.
-- **Fast** — coalesced spans + resident-cache-first serving: **~16k rps, 50× less data** than a full read.
+- **Fast** — coalesced spans + resident-cache-first serving: **~41k rps on Linux (~7× Bun), 50× less data** than a full read.
 - **Durable at ack** — a per-stream `.keys` journal fsyncs before the append is acked; rebuilt on restart. No crash-tail window.
 - **Live** — keyed long-poll + SSE; a reader advances past other keys' data.
 - **Real-client verified** — `@durable-streams/state` `createStreamDB` folds a `?key=` read into just that conversation's rows.
@@ -156,7 +155,7 @@ rebuild the in-memory directory — so keyed reads survive a crash unchanged.
 
 ## Honest caveats
 
-- **Keyed-read CPU** is higher than a full read (filtering a byte-log reads the coalesced superset). Payoff is 50× less wire data.
+- **Keyed-read CPU** — on Linux, keyed reads are CPU-competitive with a full read and *leaner per request than Bun* (the ~1,180% CPU seen on macOS was a zero-copy-disabled fallback artifact, not a real property).
 - **Per-append fsync** on keyed writes (WAL + journal) buys durable-at-ack; batching into the WAL group commit would amortize it — a future perf optimization, not a correctness need.
 - **Linux zero-copy guard** (`#[cfg(target_os = "linux")]`) is hand-reviewed but not compiled on macOS — needs a Linux/CI build.
 - **`crates/ds-index`** (Prisma-style fuse-filter segment index) is tested but deliberately **not wired in** — the exact in-memory directory makes it unnecessary until a stream outgrows memory or spans thousands of cold segments. At that extreme, Bun's segment index likely beats the coalesce-and-filter approach until this is wired.
