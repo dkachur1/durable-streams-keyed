@@ -1,9 +1,7 @@
 # durable-streams-keyed
 
-> **Keyed-by-conversation reads for the kernel-speed Rust Durable Streams server.**
-> Pull *one* conversation out of a multiplexed stream — fast, durable, and live —
-> on the native `sendfile`/`splice` server that also does copy-on-write forks,
-> without breaking the client you already run.
+> **Keyed-by-conversation reads for the Rust Durable Streams server.**
+> Read one conversation out of a multiplexed stream — fast, durable, live.
 
 One stream per factory, `Stream-Key: <conversation>` on write, `?key=<conversation>`
 on read. That's the [Prisma Bun server's](https://github.com/prisma/streams)
@@ -131,7 +129,4 @@ Read `docs/integration-points.md` before touching `vendor/`.
 
 ## License
 
-Apache-2.0 (see `LICENSE`). `NOTICE` records provenance: patches over vendored
-`durable-streams` source (Apache-2.0), and `ds-index` as an independent
-reimplementation of Prisma streams' publicly documented index design (also
-Apache-2.0) — no code copied from either project.
+Apache-2.0 — see `LICENSE` and `NOTICE` (provenance).
