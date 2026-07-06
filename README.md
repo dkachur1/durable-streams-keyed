@@ -29,80 +29,21 @@ depend on — see `docs/integration-points.md`).
 
 ## Benchmarks
 
-> [!NOTE]
-> Same-machine, relative numbers (a MacBook; `oha` and the server share cores
-> over loopback, no cgroup pinning) — the crate's own `.bench-local.sh`
-> methodology, for baseline-vs-change on one box. Reproduce: `bench/bench-keyed.sh`.
+Both servers in **one Linux container, same kernel**, same `oha` harness
+(N=2000, K=50, ~200 B, 6 s × 3), Rust's zero-copy paths compiled in. Both keyed
+reads are zero-config (default profile).
 
-**Keyed read isolates one conversation** — one stream, 2000 appends round-robin
-across K=50 keys, ~200 B each; medians of 3×6 s, Linux container:
+| scenario | This (Rust) | Bun | Rust |
+|---|--:|--:|:--:|
+| keyed read `?key=` (one conversation) | **41,113 rps** · 1.3 ms | 5,787 rps · 9.9 ms | **~7×** |
+| full read | **18,000 rps** · 3.4 ms | 803 rps · 77 ms | **~22×** |
+| keyed CPU / request | 0.007 | 0.017 | ~2.4× leaner |
 
-| scenario | rps | p50 | p99 | data returned |
-|---|--:|--:|--:|--:|
-| `?key=conv-7` (one conversation) | **41,113** | 1.3 ms | 5.0 ms | **8 KB** |
-| full stream (client-side filter) | 18,000 | 3.4 ms | 8.4 ms | 400 KB |
-
-Keyed reads return **50× less data** (8 KB vs 400 KB — exactly 1/K, proving
-correct server-side filtering) *and* run faster than reading the whole stream
-(the full read is loopback-bandwidth-bound at 400 KB/response; the keyed read
-moves 8 KB). vs Bun on the same kernel, this keyed read is ~7× faster — see
-below.
-
-<details>
-<summary><b>Why it got 10× faster, and base-server numbers</b></summary>
-
-<br>
-
-The keyed read went **1,644 → 16,237 rps on macOS** (41,113 on Linux) once it (a)
-read resident-cache-first instead of per-span file reads and (b) coalesced a
-key's scattered spans into few contiguous reads — porting Prisma's *serving
-pattern* ("one contiguous read, filter in RAM"), **not** its probabilistic index.
-
-Base server (unpatched, hot stream, `.bench-local.sh`): read1k 161,768 rps
-(p50 0.39 ms), read1m 10,715 rps (p50 2.95 ms, `sendfile`), append 7,808 rps
-(p50 8.1 ms, fsync-bound). Upstream kernel-speed ceiling on dedicated hardware:
-~860k appends/s, ~2 GB/s reads, ~515 MB @ 100k streams.
-
-</details>
-
-### vs Bun, on the same machine
-
-Prisma's Bun server (`prisma/streams` @ `b891877`, v0.1.11) benchmarked with the
-same `oha` harness (N=2000, K=50, ~200 B, c=64, 6 s × 3). Both keyed reads are
-**zero-config** (default profile) — no divergence.
-
-**Both servers in one Linux container, same kernel** — the definitive run, with
-Rust's `#[cfg(target_os = "linux")]` zero-copy paths compiled in:
-
-| scenario | This (Rust) | Bun (uncapped) | Rust |
-|---|--:|--:|--:|
-| **keyed read** `?key=` | **41,113 rps** · 1.3 ms | 5,787 rps · 9.9 ms | **~7.1×** |
-| **full read** | **18,000 rps** · 3.4 ms | 803 rps · 77 ms | **~22×** |
-| keyed CPU per req | 300%/41k = **0.007** | 100%/5.8k = 0.017 | ~2.4× leaner |
-
-On the same kernel Rust wins keyed reads **~7× on throughput and ~2.4× on
-CPU-per-request**, and full reads ~22×. Full breakdown + toolchain:
-`bench/bun/linux/RESULTS.md`.
-
-> [!NOTE]
-> **This supersedes the earlier macOS numbers.** On macOS the zero-copy read
-> path (`#[cfg(target_os = "linux")]`) is off, so Rust ran a buffered fallback —
-> which both slowed its reads *and* made keyed reads look CPU-hungry (~1,180%).
-> The Linux run shows that CPU cost was a **macOS artifact**: on Linux Rust keyed
-> reads are actually *leaner* per request than Bun. The earlier "Bun wins
-> CPU-efficiency" read does not hold on the real target platform.
-
-<details>
-<summary>macOS numbers (superseded — zero-copy read path disabled)</summary>
-
-<br>
-
-Same harness on macOS (`oha` 1.14.0): Rust keyed 16,237 rps · 3.2 ms (but
-~1,180% cpu, the fallback artifact) vs Bun 6,485 · 9.5 ms; Rust full 24,356 vs
-Bun 1,135. Bun's stock 1000-record cap returns half the stream, so uncapped is
-used for full-read parity. Raw numbers in `bench/bun/`.
-
-</details>
+The keyed read returns **50× less data** (8 KB vs 400 KB — exactly 1/K, correct
+server-side filtering) and beats Bun ~7× while using less CPU per request; full
+reads are ~22× (native zero-copy vs interpreted). Laptop-Docker relative, not
+dedicated-hardware absolutes; reproduce with `bench/bun/linux/build-and-run.sh`,
+details in `bench/bun/linux/RESULTS.md`.
 
 ## What works
 
