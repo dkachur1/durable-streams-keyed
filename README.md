@@ -78,6 +78,15 @@ keyed reads with **zero schema setup** (default profile) — no config divergenc
 | **full read** (uncapped) | **24,356 rps** · 2.6 ms | 1,135 rps · 54.5 ms |
 | append (unkeyed) | ~7,808 rps | ~203 rps* |
 
+> [!IMPORTANT]
+> **Measured on macOS, where Rust's zero-copy read path is disabled.** The
+> `sendfile` read path is `#[cfg(target_os = "linux")]`, so on this Mac the Rust
+> server served *unkeyed* reads via a buffered fallback — meaning the **full-read
+> and append numbers understate Rust** (on Linux it would use `sendfile`). Keyed
+> reads serve a materialized `Body::Full` on both platforms, so that number is
+> representative. The definitive comparison is **both servers on the same Linux
+> host** — an outstanding TODO, not yet run.
+
 **The honest read:**
 - **Keyed read** — Rust is ~2.5× the throughput and ~3× lower latency, **but at
   ~4.5× the CPU per request.** Our speed comes from reading the coalesced
