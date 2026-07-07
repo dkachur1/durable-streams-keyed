@@ -33,10 +33,6 @@ Both servers in **one Linux container, same kernel**, same `oha` harness
 | full read | **18,000 rps** · 3.4 ms | 803 rps · 77 ms | **~22×** |
 | keyed CPU / request | 0.007 | 0.017 | ~2.4× leaner |
 
-The 8 KB vs 400 KB gap is exactly 1/K — correct server-side filtering, not an
-estimate. Laptop-Docker relative, not dedicated-hardware absolutes; reproduce
-with `bench/bun/linux/build-and-run.sh`, details in `bench/bun/linux/RESULTS.md`.
-
 ## Features
 
 - **`Stream-Key` on append + `?key=` filtered reads** — isolate one conversation; composes with `?offset=`.
