@@ -14,11 +14,10 @@
  }
  
  /// Crash-recovery intent for a live-file compaction in progress. While set, the
-@@ -309,8 +316,108 @@
-             format!("\"{}:{}:{}:c\"", self.id, start, end)
+@@ -310,9 +317,174 @@
          } else {
              format!("\"{}:{}:{}\"", self.id, start, end)
-+        }
+         }
 +    }
 +
 +    /// Record one durable keyed append: push into the in-memory index and
@@ -41,59 +40,88 @@
 +        kd.journal.flush_if_dirty();
 +    }
 +
-+    /// In-stream keyed fork: seed `dest_key` from the first `cut` spans recorded
-+    /// under `src_key` (append order), copying their `(offset, len)` verbatim
-+    /// into `dest_key`'s directory in THIS same stream. The inherited bytes
-+    /// already live here, so a later `?key=dest_key` read gathers them directly
-+    /// (`keyed_spans` → `gather_keyed_bytes`) — no new stream, no fork parent
-+    /// chain — and subsequent keyed appends under `dest_key` extend it (their
-+    /// higher offsets keep the directory offset-ordered, which
-+    /// `handle_keyed_catchup`'s coalescing scan relies on). This is the
-+    /// multiplexed one-stream-per-namespace fork: forking a conversation KEY out
-+    /// of the shared stream, not forking a whole parent stream by path.
++    /// In-stream keyed fork: record `dest_key` as a zero-copy REFERENCE to the
++    /// first `cut` spans of `src_key` — matching native durable-streams fork,
++    /// where offsets below the cut resolve against the source WITHOUT copying.
++    /// No prefix spans are duplicated into `dest_key`'s directory; instead a
++    /// `ForkRef { inherits_from: src_key, cut }` is stored, and a later
++    /// `?key=dest_key` read RESOLVES the reference (`keyed_spans` →
++    /// `KeyDir::resolved_spans` → `gather_keyed_bytes`): it splices the source
++    /// key's spans strictly before the cut — recursively, if the source is
++    /// itself a fork — ahead of `dest_key`'s own appended spans. No new stream,
++    /// no fork parent chain of streams; subsequent keyed appends under
++    /// `dest_key` extend it (their higher offsets keep the resolved directory
++    /// offset-ordered, which `handle_keyed_catchup`'s coalescing scan relies on).
++    /// This is the multiplexed one-stream-per-namespace fork: forking a
++    /// conversation KEY out of the shared stream, not a whole parent stream.
 +    ///
 +    /// `cut == None` inherits all of `src_key`'s spans; a `cut` past the span
-+    /// count inherits all of them. Durable — the copied entries are journaled and
-+    /// fsync'd once before returning, same guarantee as `record_keyed_append`.
-+    /// Returns the number of spans inherited.
++    /// count is clamped to it. The cut is SNAPSHOTTED to a concrete span count
++    /// at fork time (resolving the source now), so appends to `src_key` ABOVE
++    /// the cut never leak onto the branch — the inherited prefix is immutable.
++    /// Durable — the fork reference is journaled and fsync'd once before
++    /// returning, same guarantee as `record_keyed_append`. Returns the number
++    /// of spans inherited (the effective cut).
 +    pub fn fork_key(&self, src_key: &str, dest_key: &str, cut: Option<usize>) -> usize {
 +        let mut kd = self.key_dir.lock().unwrap_or_else(|e| e.into_inner());
-+        let src_spans: Vec<(u64, u64)> = match kd.map.get(src_key) {
-+            Some(v) => {
-+                let take = cut.unwrap_or(v.len()).min(v.len());
-+                v[..take].to_vec()
-+            }
-+            None => Vec::new(),
-+        };
-+        if src_spans.is_empty() {
-+            return 0;
-+        }
-+        {
-+            let dest = kd.map.entry(dest_key.to_string()).or_default();
-+            dest.extend_from_slice(&src_spans);
-+        }
-+        for (off, len) in &src_spans {
-+            kd.journal.append(dest_key, *off, *len);
-+        }
++        let src_len = kd.resolved_spans(src_key).len();
++        let effective_cut = cut.unwrap_or(src_len).min(src_len);
++        kd.forks.insert(
++            dest_key.to_string(),
++            ForkRef {
++                inherits_from: src_key.to_string(),
++                cut: effective_cut,
++            },
++        );
++        kd.journal.append_fork(dest_key, src_key, effective_cut);
 +        kd.journal.flush_if_dirty();
-+        src_spans.len()
-+    }
++        effective_cut
+     }
 +
-+    /// Exact `(offset, len)` spans recorded under `key` whose offset falls in
-+    /// `[start, end)`, in append order (see `handlers::handle_keyed_catchup`).
++    /// Exact `(offset, len)` spans that resolve under `key` whose offset falls
++    /// in `[start, end)`, in resolved order — the fork-inherited prefix (if
++    /// `key` is a branch) followed by `key`'s own appends (see
++    /// `KeyDir::resolved_spans` and `handlers::handle_keyed_catchup`).
 +    pub fn keyed_spans(&self, key: &str, start: u64, end: u64) -> Vec<(u64, u64)> {
 +        let kd = self.key_dir.lock().unwrap_or_else(|e| e.into_inner());
-+        kd.map
-+            .get(key)
-+            .map(|v| {
-+                v.iter()
-+                    .copied()
-+                    .filter(|(off, _)| *off >= start && *off < end)
-+                    .collect()
-+            })
-+            .unwrap_or_default()
++        kd.resolved_spans(key)
++            .into_iter()
++            .filter(|(off, _)| *off >= start && *off < end)
++            .collect()
 +    }
++
++    /// Test-only: number of spans physically stored under `key` in the OWN-spans
++    /// map — a branch key stores only its own appends here (the inherited prefix
++    /// is a zero-copy reference), so this is O(branch appends), NOT O(inherited
++    /// prefix). Proves the fork does not duplicate prefix spans.
++    #[cfg(test)]
++    pub fn keyed_own_span_count(&self, key: &str) -> usize {
++        let kd = self.key_dir.lock().unwrap_or_else(|e| e.into_inner());
++        kd.map.get(key).map(|v| v.len()).unwrap_or(0)
++    }
++
++    /// Test-only: whether `key` carries a zero-copy fork reference.
++    #[cfg(test)]
++    pub fn is_fork_branch(&self, key: &str) -> bool {
++        let kd = self.key_dir.lock().unwrap_or_else(|e| e.into_inner());
++        kd.forks.contains_key(key)
++    }
+ }
+ 
++/// A zero-copy in-stream keyed fork reference (see `StreamState::fork_key`):
++/// `dest_key` inherits the first `cut` spans of `inherits_from`'s resolved span
++/// list. `cut` is a concrete count snapshotted at fork time, so the inherited
++/// prefix is immutable regardless of later appends to the source.
++struct ForkRef {
++    inherits_from: String,
++    cut: usize,
 +}
++
++/// Guard against a pathological (or corrupt-journal) fork chain: resolution
++/// stops descending past this depth and treats the remaining source as empty
++/// rather than recursing without bound. Fork chains are shallow in practice
++/// (one branch per edit/regenerate).
++const MAX_FORK_DEPTH: usize = 4096;
 +
 +/// In-memory keyed-read index plus its durable journal (`key_journal.rs`), one
 +/// lock (`StreamState::key_dir`) so the memory push and the durable append are
@@ -101,7 +129,13 @@
 +/// order == offset order, and replay after a restart must reproduce the exact
 +/// order a live run saw.
 +pub struct KeyDir {
++    /// Per-key OWN appended spans (a branch key stores only its appends ABOVE
++    /// the fork cut here — the inherited prefix is a reference in `forks`, not
++    /// copied).
 +    map: HashMap<String, Vec<(u64, u64)>>,
++    /// Zero-copy fork references: branch key → the source key + cut it inherits
++    /// (see `ForkRef` and `resolved_spans`).
++    forks: HashMap<String, ForkRef>,
 +    journal: crate::key_journal::KeyJournal,
 +}
 +
@@ -110,20 +144,52 @@
 +    fn empty(file_path: &std::path::Path) -> Self {
 +        KeyDir {
 +            map: HashMap::new(),
++            forks: HashMap::new(),
 +            journal: crate::key_journal::KeyJournal::empty(file_path),
-         }
-     }
++        }
++    }
 +
 +    /// Rebuild from the durable journal on boot — see
 +    /// `key_journal::KeyJournal::recover`.
 +    fn recovered(file_path: &std::path::Path) -> Self {
-+        let (map, journal) = crate::key_journal::KeyJournal::recover(file_path);
-+        KeyDir { map, journal }
++        let (map, forks, journal) = crate::key_journal::KeyJournal::recover(file_path);
++        let forks = forks
++            .into_iter()
++            .map(|(dest, (inherits_from, cut))| (dest, ForkRef { inherits_from, cut }))
++            .collect();
++        KeyDir { map, forks, journal }
 +    }
- }
- 
++
++    /// The full ordered `(offset, len)` span list resolving under `key`: if
++    /// `key` is a fork branch, the first `cut` spans of its source's resolved
++    /// list (recursively — a fork of a fork walks the whole chain), spliced
++    /// AHEAD of `key`'s own appended spans. Inherited spans predate the branch's
++    /// own appends, so the list stays offset-ascending (the coalescing keyed
++    /// read relies on that). A non-branch key just returns its own spans.
++    fn resolved_spans(&self, key: &str) -> Vec<(u64, u64)> {
++        self.resolved_spans_bounded(key, MAX_FORK_DEPTH)
++    }
++
++    fn resolved_spans_bounded(&self, key: &str, depth: usize) -> Vec<(u64, u64)> {
++        let mut out = Vec::new();
++        if depth > 0 {
++            if let Some(f) = self.forks.get(key) {
++                let src = self.resolved_spans_bounded(&f.inherits_from, depth - 1);
++                let take = f.cut.min(src.len());
++                out.extend_from_slice(&src[..take]);
++            }
++        }
++        if let Some(own) = self.map.get(key) {
++            out.extend_from_slice(own);
++        }
++        out
++    }
++}
++
  pub struct Store {
-@@ -388,6 +495,7 @@
+     pub streams: DashMap<String, Arc<StreamState>>,
+     pub data_dir: PathBuf,
+@@ -388,6 +560,7 @@
      fn recover(&self, streams_dir: &std::path::Path) -> std::io::Result<()> {
          let mut metas: HashMap<String, (Meta, PathBuf)> = HashMap::new();
          let mut data_files: Vec<PathBuf> = Vec::new();
@@ -131,7 +197,7 @@
          for entry in std::fs::read_dir(streams_dir)? {
              let p = entry?.path();
              let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-@@ -399,6 +507,14 @@
+@@ -399,6 +572,14 @@
                  // durable residual for a pending intent, else removed there). Do
                  // NOT treat it as an orphan data file — that would delete the
                  // durable residual before recovery can promote it.
@@ -146,7 +212,7 @@
              } else if name.ends_with(".meta") {
                  let data_path = PathBuf::from(p.as_os_str().to_str().unwrap().trim_end_matches(".meta"));
                  if data_path.exists() {
-@@ -417,6 +533,14 @@
+@@ -417,6 +598,14 @@
          // Drop orphan data files (no usable sidecar).
          for p in data_files {
              if !metas.values().any(|(_, dp)| *dp == p) {
@@ -161,7 +227,7 @@
                  let _ = std::fs::remove_file(&p);
              }
          }
-@@ -577,6 +701,8 @@
+@@ -577,6 +766,8 @@
              // the file size each boot (see `file_base` above), so the in-memory
              // cell starts clear; the next meta write persists the cleared marker.
              compaction: StdMutex::new(None),
@@ -170,7 +236,7 @@
              config: StreamConfig {
                  content_type: meta.content_type.clone(),
                  ttl_seconds: meta.ttl_seconds,
-@@ -638,6 +764,7 @@
+@@ -638,6 +829,7 @@
              let fp = st.file_path.clone();
              tokio::task::spawn_blocking(move || {
                  let _ = std::fs::remove_file(meta_path(&fp));
@@ -178,7 +244,7 @@
                  let _ = std::fs::remove_file(fp);
              });
              self.release_parent(st);
-@@ -668,6 +795,7 @@
+@@ -668,6 +860,7 @@
              let fp = parent.file_path.clone();
              tokio::task::spawn_blocking(move || {
                  let _ = std::fs::remove_file(meta_path(&fp));
@@ -186,7 +252,7 @@
                  let _ = std::fs::remove_file(fp);
              });
              cur = parent.parent.clone();
-@@ -709,6 +837,8 @@
+@@ -709,6 +902,8 @@
              bytes: base_offset,
              closed,
          });
@@ -195,7 +261,7 @@
          let state = Arc::new(StreamState {
              id,
              path: path.to_string(),
-@@ -738,6 +868,7 @@
+@@ -738,6 +933,7 @@
              tier: crate::tier::TierState::default(),
              blobstore: self.blobstore.clone(),
              compaction: StdMutex::new(None),
@@ -203,7 +269,7 @@
              config,
          });
          match self.streams.entry(path.to_string()) {
-@@ -1024,6 +1155,15 @@
+@@ -1024,6 +1220,15 @@
      if durable {
          fsync_parent_dir(&final_path)?;
      }

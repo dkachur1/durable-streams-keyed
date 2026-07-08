@@ -37,12 +37,12 @@ Both servers in **one Linux container, same kernel**, same `oha` harness
 
 - **`Stream-Key` on append + `?key=` filtered reads** — isolate one conversation; composes with `?offset=`.
 - **`Stream-Key` on fork-create** (whole-stream fork) — set the key in the same request as the fork trio (`Stream-Forked-From` = a stream **path**, `-Fork-Offset` / `-Fork-Sub-Offset`); the new branch stream is `?key=`-routable at birth (its inherited byte prefix resolves through the fork chain) and later keyed appends route to it — no separate priming append needed.
-- **In-stream keyed fork** (fork one conversation out of a multiplexed stream) — when `Stream-Forked-From` names a **source KEY** within an already-existing target stream and `Stream-Key` names the new branch key, the branch inherits the source key's rows **strictly before the cut** — `Stream-Fork-Sub-Offset` is the cut, expressed as the source key's span index (count of its appends to inherit; omitted = all). No new stream, no `Stream-Fork-Offset` (the inherited rows already live in this stream); other keys interleaved in the same stream never leak in, and keyed appends under the branch key extend it. This is the shape a one-stream-per-namespace app (`Stream-Key` = conversation) needs to fork/edit a single conversation — a whole-stream fork would inherit every conversation's bytes and can't isolate one by key.
+- **In-stream keyed fork** (fork one conversation out of a multiplexed stream) — when `Stream-Forked-From` names a **source KEY** within an already-existing target stream and `Stream-Key` names the new branch key, the branch inherits the source key's rows **strictly before the cut by REFERENCE** — zero-copy, matching native durable-streams fork (offsets below the cut resolve against the source without copying; a `?key=` read of the branch resolves the reference through the fork chain at read time, splicing the source's inherited prefix ahead of the branch's own appends). `Stream-Fork-Sub-Offset` is the cut, expressed as the source key's span index (count of its appends to inherit; omitted = all), snapshotted at fork time so the inherited prefix is immutable — later appends to the source above the cut never appear on the branch. No prefix spans are duplicated, no new stream, no `Stream-Fork-Offset` (the inherited rows already live in this stream); other keys interleaved in the same stream never leak in, and keyed appends under the branch key extend it. This is the shape a one-stream-per-namespace app (`Stream-Key` = conversation) needs to fork/edit a single conversation — a whole-stream fork would inherit every conversation's bytes and can't isolate one by key.
 - **Fast** — coalesced spans + resident-cache-first serving (see [Benchmarks](#benchmarks)).
 - **Durable at ack** — a per-stream `.keys` journal fsyncs before the append is acked; rebuilt on restart. No crash-tail window.
 - **Live** — keyed long-poll + SSE; a reader advances past other keys' data.
 - **Real-client verified** — `@durable-streams/state`'s `createStreamDB` folds a `?key=` read into just that conversation's rows.
-- **103 tests** (87 upstream + keying / fork-keying / in-stream keyed fork / persistence / live / journal); patch set verified to apply clean and compile.
+- **109 tests** (87 upstream + keying / fork-keying / in-stream keyed fork (zero-copy reference, fork-of-fork, divergence, restart) / persistence / live / journal); patch set verified to apply clean and compile.
 
 ## How it works
 
@@ -80,6 +80,16 @@ flowchart TD
     F --> P
     P --> B["response = only conv-7's bytes<br/><b>50× less data</b>"]
 ```
+
+**A forked branch key resolves by reference (zero-copy).** An in-stream keyed
+fork records only a `{ inherits_from, cut }` reference on the branch key — no
+prefix spans are copied. `keyed_spans()` resolves it at read time: it splices
+the source key's spans strictly before the cut (recursively, so a fork of a fork
+walks the whole chain) ahead of the branch's own appended spans, then filters to
+the read window. The `cut` is snapshotted at fork time, so the inherited prefix
+is immutable and the branch diverges cleanly from the source. The reference is
+journaled in `.keys` alongside span records (same torn-tail-safe framing), so it
+rebuilds on restart too.
 
 On restart, the `.keys` journal is replayed (torn-tail-safe, like the WAL) to
 rebuild the in-memory directory — so keyed reads survive a crash unchanged.
